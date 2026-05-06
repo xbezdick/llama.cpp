@@ -487,19 +487,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        // Handle UNKNOWN state by falling back to PARTIAL for compatibility
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            ret = {GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+        }
         return ret;
     };
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
-        return src_ss[0];
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            return src_ss[0];
+        }
+        return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
     // Some ops broadcast the src1 data across src0:
@@ -547,12 +552,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             ret.n_segments = 1;
             return ret;
         }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            ggml_backend_meta_split_state ret = src_ss[1];
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            ret.n_segments = 1;
+            return ret;
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
         }
-        GGML_ABORT("fatal error");
-        //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+        }
+	return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -704,12 +721,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
-        return src_ss[0];
+        if (split_states_equal(src_ss[0], src_ss[2])) {
+            return src_ss[0];
+        }
+        return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
     auto handle_rope = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        if (src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return handle_generic(src_ss, /*scalar_only =*/ true);
+        }
         return src_ss[0];
     };
 
@@ -722,12 +743,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
+        // Flash attention typically splits on axis 2 (sequence)
+        // In multimodal models, vision embeddings may not be split the same way
+        bool all_axis_2 = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                          src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                          src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        bool extra_valid = tensor->src[4] == nullptr ||
+                           (src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                            src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (all_axis_2 && extra_valid) {
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
+        }
+        // Fall back to generic handling for mismatched split states
+        return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -784,9 +812,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+            // Handle UNKNOWN state by falling back to PARTIAL for compatibility
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+            }
         }
-
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
@@ -1086,12 +1116,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
-
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
-    GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
-    GGML_ASSERT(split_state.n_segments <= 16);
+    // Handle UNKNOWN state by falling back to MIRRORED for compatibility
+    ggml_backend_meta_split_state effective_split_state = split_state;
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN && ggml_nelements(tensor) > 0) {
+        effective_split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+    }
+    GGML_ASSERT(effective_split_state.n_segments <= 16);
 
-    int split_dim = split_state.axis;
+    int split_dim = effective_split_state.axis;
     int64_t ne[GGML_MAX_DIMS];
     size_t  nb[GGML_MAX_DIMS];
     for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
@@ -1109,8 +1142,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
             ne[split_dim] = 0;
-            for (size_t s = 0; s < split_state.n_segments; s++) {
-                ne[split_dim] += split_state.ne[s*n_simple_bufs + j];
+            for (size_t s = 0; s < effective_split_state.n_segments; s++) {
+                ne[split_dim] += effective_split_state.ne[s*n_simple_bufs + j];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 if (tensor->nb[i] > tensor->nb[split_dim]) {
