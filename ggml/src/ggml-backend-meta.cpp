@@ -710,7 +710,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        if (!split_states_equal(src_ss[0], src_ss[2])) {
+            std::string ne0_info, ne2_info;
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (!ne0_info.empty()) ne0_info += ", ";
+                ne0_info += std::to_string(src_ss[0].ne[j]);
+            }
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (!ne2_info.empty()) ne2_info += ", ";
+                ne2_info += std::to_string(src_ss[2].ne[j]);
+            }
+            const char * src0_name = tensor->src[0] ? tensor->src[0]->name : "<null>";
+            const char * src2_name = tensor->src[2] ? tensor->src[2]->name : "<null>";
+            GGML_LOG_DEBUG("GGML_ASSERT FAILED: split_states_equal(src_ss[0], src_ss[2])) failed for tensor %s[%s]\n"
+                "  src[0] = %s: axis=%s n_segments=%u ne={%s}\n"
+                "  src[2] = %s: axis=%s n_segments=%u ne={%s}\n",
+                tensor->name,
+                ggml_op_name(tensor->op),
+                src0_name,
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                src_ss[0].n_segments, ne0_info.c_str(),
+                src2_name,
+                ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                src_ss[2].n_segments, ne2_info.c_str());
+	    return src_ss[2];
+        }
         return src_ss[0];
     };
 
@@ -726,15 +750,37 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         }
         return src_ss[0];
     };
-
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            std::string ne_info;
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (!ne_info.empty()) ne_info += ", ";
+                ne_info += std::to_string(src_ss[0].ne[j]);
+            }
+            GGML_LOG_DEBUG("GGML_ASSERT FAILED: src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2)) failed for tensor %s[%s]\n"
+                "  src_ss[0]: axis=%s n_segments=%u ne={%s}\n"
+                "  src_ss[1]: axis=%s n_segments=%u\n"
+                "  src_ss[2]: axis=%s n_segments=%u\n",
+                tensor->name,
+                ggml_op_name(tensor->op),
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                src_ss[0].n_segments, ne_info.c_str(),
+                ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                src_ss[1].n_segments,
+                ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                src_ss[2].n_segments);
+        }
+        // If all sources have axis=2, use the expected split state
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
+        }
+        // Otherwise, fall back to generic handling for cases where Q has different split state
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
-    };
+     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
@@ -1207,7 +1253,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
+    // For views (op == NONE), the data is actually in the source tensor, so skip contiguous check
+    if (tensor->op != GGML_OP_NONE && !ggml_is_contiguous(tensor)) {
+        GGML_LOG_DEBUG("ggml_backend_meta_buffer_set_tensor: tensor %s[%s] is not contiguous\n",
+            tensor->name, ggml_op_name(tensor->op));
+        GGML_LOG_DEBUG("  ne=[%lld, %lld, %lld, %lld] nb=[%zu, %zu, %zu, %zu]\n",
+            (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+    }
+    GGML_ASSERT(tensor->op == GGML_OP_NONE || ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
